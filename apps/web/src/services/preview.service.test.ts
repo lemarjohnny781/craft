@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach } from 'vitest';
 import { PreviewService } from './preview.service';
 import type { CustomizationConfig } from '@craft/types';
 
@@ -101,12 +101,9 @@ describe('PreviewService', () => {
             const mainnetResult = service.generatePreview(mainnetConfig);
             const testnetResult = service.generatePreview(testnetConfig);
 
-            // Account balances should differ
             expect(mainnetResult.mockData.accountBalance).not.toBe(
                 testnetResult.mockData.accountBalance
             );
-
-            // Asset prices should differ
             expect(mainnetResult.mockData.assetPrices.XLM).not.toBe(
                 testnetResult.mockData.assetPrices.XLM
             );
@@ -116,7 +113,6 @@ describe('PreviewService', () => {
             const result1 = service.generatePreview(mainnetConfig);
             const result2 = service.generatePreview(mainnetConfig);
 
-            // Mock data structure should be consistent (excluding timestamp)
             expect(result1.mockData.accountBalance).toBe(result2.mockData.accountBalance);
             expect(result1.mockData.recentTransactions.length).toBe(
                 result2.mockData.recentTransactions.length
@@ -178,7 +174,6 @@ describe('PreviewService', () => {
                 tx.timestamp.getTime()
             );
 
-            // Should be in descending order (most recent first)
             for (let i = 0; i < timestamps.length - 1; i++) {
                 expect(timestamps[i]).toBeGreaterThanOrEqual(timestamps[i + 1]);
             }
@@ -202,8 +197,6 @@ describe('PreviewService', () => {
 
     describe('mock data isolation', () => {
         it('generates mock data without making network requests', () => {
-            // This test verifies that generatePreview is synchronous and doesn't
-            // make any async network calls to Stellar
             const result = service.generatePreview(mainnetConfig);
 
             expect(result).toBeDefined();
@@ -240,6 +233,204 @@ describe('PreviewService', () => {
             expect(mainnetResult.mockData.assetPrices.BTC).toBeGreaterThan(
                 testnetResult.mockData.assetPrices.BTC
             );
+        });
+    });
+
+    describe('updatePreview', () => {
+        it('merges partial changes into current customization', () => {
+            const current = mainnetConfig;
+            const changes = {
+                branding: {
+                    appName: 'Updated DEX',
+                },
+            };
+
+            const result = service.updatePreview(current, changes);
+
+            expect(result.customization.branding.appName).toBe('Updated DEX');
+            expect(result.customization.branding.primaryColor).toBe(current.branding.primaryColor);
+            expect(result.customization.stellar.network).toBe(current.stellar.network);
+        });
+
+        it('detects changed fields', () => {
+            const current = mainnetConfig;
+            const changes = {
+                branding: {
+                    appName: 'New Name',
+                    primaryColor: '#ff0000',
+                },
+            };
+
+            const result = service.updatePreview(current, changes);
+
+            expect(result.changedFields).toContain('branding.appName');
+            expect(result.changedFields).toContain('branding.primaryColor');
+            expect(result.changedFields.length).toBe(2);
+        });
+
+        it('does not include unchanged fields in changedFields', () => {
+            const current = mainnetConfig;
+            const changes = {
+                branding: {
+                    appName: mainnetConfig.branding.appName,
+                },
+            };
+
+            const result = service.updatePreview(current, changes);
+
+            expect(result.changedFields).not.toContain('branding.appName');
+        });
+
+        it('does not regenerate mock data for branding changes', () => {
+            const current = mainnetConfig;
+            const changes = {
+                branding: {
+                    appName: 'Updated',
+                    primaryColor: '#ff0000',
+                },
+            };
+
+            const result = service.updatePreview(current, changes);
+
+            expect(result.mockData).toBeUndefined();
+            expect(result.changedFields).toContain('branding.appName');
+        });
+
+        it('does not regenerate mock data for feature changes', () => {
+            const current = mainnetConfig;
+            const changes = {
+                features: {
+                    enableCharts: false,
+                },
+            };
+
+            const result = service.updatePreview(current, changes);
+
+            expect(result.mockData).toBeUndefined();
+            expect(result.changedFields).toContain('features.enableCharts');
+        });
+
+        it('regenerates mock data when network changes', () => {
+            const current = mainnetConfig;
+            const changes = {
+                stellar: {
+                    network: 'testnet' as const,
+                    horizonUrl: 'https://horizon-testnet.stellar.org',
+                },
+            };
+
+            const result = service.updatePreview(current, changes);
+
+            expect(result.mockData).toBeDefined();
+            expect(result.changedFields).toContain('stellar.network');
+            expect(result.customization.stellar.network).toBe('testnet');
+        });
+
+        it('does not regenerate mock data for horizon URL change only', () => {
+            const current = mainnetConfig;
+            const changes = {
+                stellar: {
+                    horizonUrl: 'https://custom-horizon.stellar.org',
+                },
+            };
+
+            const result = service.updatePreview(current, changes);
+
+            expect(result.mockData).toBeUndefined();
+            expect(result.changedFields).toContain('stellar.horizonUrl');
+        });
+
+        it('handles multiple field changes across sections', () => {
+            const current = mainnetConfig;
+            const changes = {
+                branding: {
+                    appName: 'Multi Update',
+                },
+                features: {
+                    enableAnalytics: true,
+                },
+                stellar: {
+                    sorobanRpcUrl: 'https://soroban-rpc.stellar.org',
+                },
+            };
+
+            const result = service.updatePreview(current, changes);
+
+            expect(result.changedFields).toContain('branding.appName');
+            expect(result.changedFields).toContain('features.enableAnalytics');
+            expect(result.changedFields).toContain('stellar.sorobanRpcUrl');
+            expect(result.changedFields.length).toBe(3);
+        });
+
+        it('returns valid timestamp', () => {
+            const current = mainnetConfig;
+            const changes = { branding: { appName: 'Test' } };
+
+            const result = service.updatePreview(current, changes);
+
+            expect(result.timestamp).toBeDefined();
+            expect(new Date(result.timestamp)).toBeInstanceOf(Date);
+        });
+
+        it('handles empty changes object', () => {
+            const current = mainnetConfig;
+            const changes = {};
+
+            const result = service.updatePreview(current, changes);
+
+            expect(result.customization).toEqual(current);
+            expect(result.changedFields).toEqual([]);
+            expect(result.mockData).toBeUndefined();
+        });
+
+        it('preserves all fields when updating single field', () => {
+            const current = testnetConfig;
+            const changes = {
+                branding: {
+                    primaryColor: '#123456',
+                },
+            };
+
+            const result = service.updatePreview(current, changes);
+
+            expect(result.customization.branding.appName).toBe(current.branding.appName);
+            expect(result.customization.branding.secondaryColor).toBe(
+                current.branding.secondaryColor
+            );
+            expect(result.customization.features).toEqual(current.features);
+            expect(result.customization.stellar).toEqual(current.stellar);
+        });
+
+        it('network change from mainnet to testnet regenerates appropriate mock data', () => {
+            const current = mainnetConfig;
+            const changes = {
+                stellar: {
+                    network: 'testnet' as const,
+                    horizonUrl: 'https://horizon-testnet.stellar.org',
+                },
+            };
+
+            const result = service.updatePreview(current, changes);
+
+            expect(result.mockData).toBeDefined();
+            expect(result.mockData!.accountBalance).toBe('5000.0000000');
+            expect(result.mockData!.assetPrices.XLM).toBe(0.10);
+        });
+
+        it('network change from testnet to mainnet regenerates appropriate mock data', () => {
+            const current = testnetConfig;
+            const changes = {
+                stellar: {
+                    network: 'mainnet' as const,
+                    horizonUrl: 'https://horizon.stellar.org',
+                },
+            };
+
+            const result = service.updatePreview(current, changes);
+
+            expect(result.mockData).toBeDefined();
+            expect(result.mockData!.accountBalance).toBe('10000.0000000');
+            expect(result.mockData!.assetPrices.XLM).toBe(0.12);
         });
     });
 });

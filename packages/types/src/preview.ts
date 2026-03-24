@@ -18,3 +18,15 @@ export interface PreviewData {
     assets: PreviewAsset[];
     mockData: StellarMockData;
 }
+export interface PreviewUpdate {
+    changes: Partial<CustomizationConfig>;
+    changedFields: string[];
+    requiresMockDataRefresh: boolean;
+}
+
+export interface PreviewUpdatePayload {
+    customization: CustomizationConfig;
+    mockData?: StellarMockData;
+    changedFields: string[];
+    timestamp: string;
+}

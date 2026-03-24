@@ -20,6 +20,105 @@ export class PreviewService {
             timestamp: new Date().toISOString(),
         };
     }
+    /**
+     * Update preview with partial customization changes.
+     * Detects changed fields and only regenerates mock data if network config changed.
+     * Returns minimal update payload for efficient iframe updates.
+     */
+    updatePreview(
+        currentCustomization: CustomizationConfig,
+        changes: Partial<CustomizationConfig>
+    ): { customization: CustomizationConfig; mockData?: StellarMockData; changedFields: string[]; timestamp: string } {
+        // Merge changes into current config
+        const updatedCustomization = this.mergeCustomization(currentCustomization, changes);
+
+        // Detect which fields changed
+        const changedFields = this.detectChangedFields(currentCustomization, changes);
+
+        // Determine if mock data needs refresh (network config changed)
+        const requiresMockDataRefresh = this.requiresMockDataRefresh(changedFields);
+
+        const payload: any = {
+            customization: updatedCustomization,
+            changedFields,
+            timestamp: new Date().toISOString(),
+        };
+
+        // Only regenerate mock data if network config changed
+        if (requiresMockDataRefresh) {
+            payload.mockData = this.generateMockData(updatedCustomization);
+        }
+
+        return payload;
+    }
+
+    /**
+     * Deep merge partial changes into current customization.
+     */
+    private mergeCustomization(
+        current: CustomizationConfig,
+        changes: Partial<CustomizationConfig>
+    ): CustomizationConfig {
+        return {
+            branding: { ...current.branding, ...(changes.branding ?? {}) },
+            features: { ...current.features, ...(changes.features ?? {}) },
+            stellar: { ...current.stellar, ...(changes.stellar ?? {}) },
+        };
+    }
+
+    /**
+     * Detect which fields changed by comparing current and changes.
+     * Returns array of dot-notation field paths (e.g., "branding.appName").
+     */
+    private detectChangedFields(
+        current: CustomizationConfig,
+        changes: Partial<CustomizationConfig>
+    ): string[] {
+        const fields: string[] = [];
+
+        // Check branding changes
+        if (changes.branding) {
+            Object.keys(changes.branding).forEach((key) => {
+                const currentVal = (current.branding as any)[key];
+                const changeVal = (changes.branding as any)[key];
+                if (currentVal !== changeVal) {
+                    fields.push(`branding.${key}`);
+                }
+            });
+        }
+
+        // Check feature changes
+        if (changes.features) {
+            Object.keys(changes.features).forEach((key) => {
+                const currentVal = (current.features as any)[key];
+                const changeVal = (changes.features as any)[key];
+                if (currentVal !== changeVal) {
+                    fields.push(`features.${key}`);
+                }
+            });
+        }
+
+        // Check stellar changes
+        if (changes.stellar) {
+            Object.keys(changes.stellar).forEach((key) => {
+                const currentVal = (current.stellar as any)[key];
+                const changeVal = (changes.stellar as any)[key];
+                if (currentVal !== changeVal) {
+                    fields.push(`stellar.${key}`);
+                }
+            });
+        }
+
+        return fields;
+    }
+
+    /**
+     * Determine if mock data needs to be regenerated.
+     * Only network changes require mock data refresh.
+     */
+    private requiresMockDataRefresh(changedFields: string[]): boolean {
+        return changedFields.some((field) => field.startsWith('stellar.network'));
+    }
 
     /**
      * Generate deterministic mock Stellar data based on network configuration.
