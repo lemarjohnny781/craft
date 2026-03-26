@@ -193,8 +193,6 @@ export class PreviewService {
         this.templateCategory = category;
     }
 
-    generatePreview(config: CustomizationConfig, viewport?: ViewportClass | null): PreviewData;
-    generatePreview(templateOrConfig: Template | CustomizationConfig, savedConfig?: Partial<CustomizationConfig> | null): PreviewConfig | PreviewData;
     generatePreview(
         templateOrConfig: Template | CustomizationConfig | undefined,
         secondParam?: ViewportClass | Partial<CustomizationConfig> | null
