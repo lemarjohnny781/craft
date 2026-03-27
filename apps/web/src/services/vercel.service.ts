@@ -35,6 +35,9 @@ export type VercelErrorCode =
     | 'RATE_LIMITED'
     | 'NETWORK_ERROR'
     | 'PROJECT_EXISTS'
+    | 'DOMAIN_ALREADY_EXISTS'
+    | 'DOMAIN_NOT_FOUND'
+    | 'DOMAIN_VERIFICATION_REQUIRED'
     | 'UNKNOWN';
 
 export class VercelApiError extends Error {
@@ -78,6 +81,118 @@ export interface TriggerDeploymentResult {
     deploymentUrl: string;
     /** Raw Vercel deployment status at creation time. */
     status: string;
+}
+
+// ── Deployment status types (Issue #92) ─────────────────────────────────────
+
+export type VercelDeploymentStatus =
+    | 'BUILDING'
+    | 'ERROR'
+    | 'CANCELED'
+    | 'QUEUED'
+    | 'READY'
+    | 'FAILED';
+
+export interface VercelDeployment {
+    /** Vercel deployment ID. */
+    id: string;
+    /** Deployment name. */
+    name: string;
+    /** Deployment URL (without https://). */
+    url: string;
+    /** Current deployment status. */
+    status: VercelDeploymentStatus;
+    /** Timestamp when the deployment was created. */
+    createdAt: number;
+    /** Timestamp when the deployment was ready. */
+    ready?: number;
+    /** Timestamp when the deployment was canceled. */
+    canceled?: number;
+    /** Timestamp when the deployment failed. */
+    error?: number;
+    /** Associated project ID. */
+    projectId?: string;
+    /** Associated project name. */
+    projectName?: string;
+    /** Deployment metadata. */
+    meta?: Record<string, unknown>;
+}
+
+export interface NormalizedDeploymentStatus {
+    /** Internal deployment status. */
+    status: 'pending' | 'building' | 'ready' | 'failed' | 'canceled';
+    /** Deployment URL. */
+    url: string;
+    /** Deployment ID. */
+    deploymentId: string;
+    /** Timestamp when the deployment was created. */
+    createdAt: Date;
+    /** Timestamp when the deployment was ready (if applicable). */
+    readyAt?: Date;
+    /** Timestamp when the deployment failed (if applicable). */
+    failedAt?: Date;
+    /** Timestamp when the deployment was canceled (if applicable). */
+    canceledAt?: Date;
+    /** Error message if the deployment failed. */
+    errorMessage?: string;
+    /** Associated project ID. */
+    projectId?: string;
+    /** Associated project name. */
+    projectName?: string;
+}
+
+// ── Domain configuration types ──────────────────────────────────────────────
+
+export interface DomainVerification {
+    /** Domain name that needs verification. */
+    domain: string;
+    /** Type of DNS record to create (e.g., 'CNAME', 'A'). */
+    type: string;
+    /** Value for the DNS record. */
+    value: string;
+    /** Domain to configure DNS for. */
+    name: string;
+}
+
+export interface AddDomainRequest {
+    /** Domain name to add (e.g., 'example.com'). */
+    domain: string;
+    /** Optional project ID to attach the domain to. */
+    projectId?: string;
+    /** Optional deployment ID to attach the domain to. */
+    deploymentId?: string;
+    /** Whether to redirect HTTPS traffic to this domain. */
+    redirect?: boolean;
+    /** Whether to force HTTPS. */
+    forceHttps?: boolean;
+}
+
+export interface AddDomainResult {
+    /** Whether the domain was successfully added. */
+    success: boolean;
+    /** Domain name that was added. */
+    domain: string;
+    /** Verification requirements, if any. */
+    verification?: DomainVerification[];
+    /** Error message if the domain could not be added. */
+    error?: string;
+    /** Error code if the domain could not be added. */
+    errorCode?: VercelErrorCode;
+}
+
+export interface DomainConfig {
+    /** Domain name. */
+    name: string;
+    /** Whether the domain is verified. */
+    verified: boolean;
+    /** Whether HTTPS is forced. */
+    forceHttps: boolean;
+    /** Whether to redirect to this domain. */
+    redirect: boolean;
+    /** Associated project ID, if any. */
+    projectId?: string;
+    /** Associated deployment ID, if any. */
+    deploymentId?: string;
 }
 
 // ── Config validation ─────────────────────────────────────────────────────────
@@ -259,6 +374,313 @@ export class VercelService {
         }
     }
 
+    // ── Deployment status retrieval (Issue #92) ──────────────────────────────
+
+    /**
+     * Get deployment details from Vercel.
+     *
+     * @param deploymentId - Vercel deployment ID
+     * @returns Deployment details or null if not found
+     */
+    async getDeployment(deploymentId: string): Promise<VercelDeployment | null> {
+        try {
+            const data = await this.request(`/v13/deployments/${deploymentId}`, {
+                method: 'GET',
+            });
+
+            return {
+                id: data.id as string,
+                name: data.name as string,
+                url: data.url as string,
+                status: (data.status as VercelDeploymentStatus) ?? 'QUEUED',
+                createdAt: data.createdAt as number,
+                ready: data.ready as number | undefined,
+                canceled: data.canceled as number | undefined,
+                error: data.error as number | undefined,
+                projectId: data.projectId as string | undefined,
+                projectName: data.projectName as string | undefined,
+                meta: data.meta as Record<string, unknown> | undefined,
+            };
+        } catch (error: unknown) {
+            if (error instanceof VercelApiError) {
+                throw error;
+            }
+            throw new VercelApiError(
+                error instanceof Error ? error.message : 'Failed to get deployment',
+                'UNKNOWN',
+            );
+        }
+    }
+
+    /**
+     * Get normalized deployment status from Vercel.
+     * Maps Vercel deployment status to internal deployment states.
+     *
+     * @param deploymentId - Vercel deployment ID
+     * @returns Normalized deployment status
+     */
+    async getDeploymentStatus(deploymentId: string): Promise<NormalizedDeploymentStatus> {
+        const deployment = await this.getDeployment(deploymentId);
+
+        if (!deployment) {
+            throw new VercelApiError(
+                `Deployment ${deploymentId} not found`,
+                'UNKNOWN',
+            );
+        }
+
+        return this.normalizeDeploymentStatus(deployment);
+    }
+
+    /**
+     * Normalize Vercel deployment status to internal deployment states.
+     *
+     * @param deployment - Vercel deployment object
+     * @returns Normalized deployment status
+     */
+    normalizeDeploymentStatus(deployment: VercelDeployment): NormalizedDeploymentStatus {
+        let status: NormalizedDeploymentStatus['status'];
+
+        switch (deployment.status) {
+            case 'QUEUED':
+                status = 'pending';
+                break;
+            case 'BUILDING':
+                status = 'building';
+                break;
+            case 'READY':
+                status = 'ready';
+                break;
+            case 'ERROR':
+            case 'FAILED':
+                status = 'failed';
+                break;
+            case 'CANCELED':
+                status = 'canceled';
+                break;
+            default:
+                status = 'pending';
+        }
+
+        const normalized: NormalizedDeploymentStatus = {
+            status,
+            url: `https://${deployment.url}`,
+            deploymentId: deployment.id,
+            createdAt: new Date(deployment.createdAt),
+            projectId: deployment.projectId,
+            projectName: deployment.projectName,
+        };
+
+        if (deployment.ready) {
+            normalized.readyAt = new Date(deployment.ready);
+        }
+
+        if (deployment.error) {
+            normalized.failedAt = new Date(deployment.error);
+            normalized.errorMessage = 'Deployment failed';
+        }
+
+        if (deployment.canceled) {
+            normalized.canceledAt = new Date(deployment.canceled);
+        }
+
+        return normalized;
+    }
+
+    /**
+     * List deployments for a project.
+     *
+     * @param projectId - Vercel project ID
+     * @param limit - Maximum number of deployments to return (default: 10)
+     * @returns List of deployments
+     */
+    async listDeployments(projectId: string, limit: number = 10): Promise<VercelDeployment[]> {
+        try {
+            const data = await this.request(`/v6/deployments?projectId=${projectId}&limit=${limit}`, {
+                method: 'GET',
+            });
+
+            const deployments = (data.deployments as Array<Record<string, unknown>>) ?? [];
+
+            return deployments.map((d) => ({
+                id: d.id as string,
+                name: d.name as string,
+                url: d.url as string,
+                status: (d.status as VercelDeploymentStatus) ?? 'QUEUED',
+                createdAt: d.createdAt as number,
+                ready: d.ready as number | undefined,
+                canceled: d.canceled as number | undefined,
+                error: d.error as number | undefined,
+                projectId: d.projectId as string | undefined,
+                projectName: d.projectName as string | undefined,
+                meta: d.meta as Record<string, unknown> | undefined,
+            }));
+        } catch (error: unknown) {
+            if (error instanceof VercelApiError) {
+                throw error;
+            }
+            throw new VercelApiError(
+                error instanceof Error ? error.message : 'Failed to list deployments',
+                'UNKNOWN',
+            );
+        }
+    }
+
+    // ── Domain configuration (Issue #91) ─────────────────────────────────────
+
+    /**
+     * Add a domain to a Vercel project or deployment.
+     * Returns verification requirements for DNS setup.
+     *
+     * @param request - Domain configuration request
+     * @returns Result with verification requirements or error details
+     */
+    async addDomain(request: AddDomainRequest): Promise<AddDomainResult> {
+        const payload: Record<string, unknown> = {
+            name: request.domain,
+        };
+
+        if (request.projectId) {
+            payload.projectId = request.projectId;
+        }
+
+        if (request.deploymentId) {
+            payload.deploymentId = request.deploymentId;
+        }
+
+        if (request.redirect !== undefined) {
+            payload.redirect = request.redirect;
+        }
+
+        if (request.forceHttps !== undefined) {
+            payload.forceHttps = request.forceHttps;
+        }
+
+        try {
+            const data = await this.request('/v4/domains', {
+                method: 'POST',
+                body: JSON.stringify(payload),
+            }, {
+                status: 409,
+                code: 'DOMAIN_ALREADY_EXISTS',
+                message: `Domain "${request.domain}" already exists`,
+            });
+
+            const verification = (data.verification as Array<Record<string, unknown>>)?.map((v) => ({
+                domain: v.domain as string,
+                type: v.type as string,
+                value: v.value as string,
+                name: v.name as string,
+            }));
+
+            return {
+                success: true,
+                domain: request.domain,
+                verification: verification?.length ? verification : undefined,
+            };
+        } catch (error: unknown) {
+            if (error instanceof VercelApiError) {
+                return {
+                    success: false,
+                    domain: request.domain,
+                    error: error.message,
+                    errorCode: error.code,
+                };
+            }
+            return {
+                success: false,
+                domain: request.domain,
+                error: error instanceof Error ? error.message : 'Unknown error',
+                errorCode: 'UNKNOWN',
+            };
+        }
+    }
+
+    /**
+     * Remove a domain from a Vercel project.
+     *
+     * @param domain - Domain name to remove
+     * @param projectId - Project ID to remove the domain from
+     */
+    async removeDomain(domain: string, projectId: string): Promise<void> {
+        try {
+            await this.request(`/v4/domains/${domain}`, {
+                method: 'DELETE',
+            });
+        } catch (error: unknown) {
+            if (error instanceof VercelApiError && error.code === 'DOMAIN_NOT_FOUND') {
+                // Domain doesn't exist, which is fine for cleanup
+                return;
+            }
+            console.error(`Vercel domain delete failed for ${domain}:`, error);
+            // Continue - DB deletion should succeed regardless
+        }
+    }
+
+    /**
+     * Get domain configuration and verification status.
+     *
+     * @param domain - Domain name to query
+     * @returns Domain configuration details
+     */
+    async getDomainConfig(domain: string): Promise<DomainConfig | null> {
+        try {
+            const data = await this.request(`/v4/domains/${domain}`, {
+                method: 'GET',
+            });
+
+            return {
+                name: data.name as string,
+                verified: data.verified as boolean,
+                forceHttps: data.forceHttps as boolean,
+                redirect: data.redirect as boolean,
+                projectId: data.projectId as string | undefined,
+                deploymentId: data.deploymentId as string | undefined,
+            };
+        } catch (error: unknown) {
+            if (error instanceof VercelApiError && error.code === 'DOMAIN_NOT_FOUND') {
+                return null;
+            }
+            throw error;
+        }
+    }
+
+    /**
+     * Verify domain ownership by checking DNS records.
+     *
+     * @param domain - Domain name to verify
+     * @returns Verification status and requirements
+     */
+    async verifyDomain(domain: string): Promise<{
+        verified: boolean;
+        requirements?: DomainVerification[];
+    }> {
+        try {
+            const data = await this.request(`/v4/domains/${domain}/verify`, {
+                method: 'POST',
+            });
+
+            const verification = (data.verification as Array<Record<string, unknown>>)?.map((v) => ({
+                domain: v.domain as string,
+                type: v.type as string,
+                value: v.value as string,
+                name: v.name as string,
+            }));
+
+            return {
+                verified: data.verified as boolean,
+                requirements: verification?.length ? verification : undefined,
+            };
+        } catch (error: unknown) {
+            if (error instanceof VercelApiError) {
+                throw error;
+            }
+            throw new VercelApiError(
+                error instanceof Error ? error.message : 'Domain verification failed',
+                'UNKNOWN',
+            );
+        }
+    }
 
     // ── Private helpers ───────────────────────────────────────────────────────
 

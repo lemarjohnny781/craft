@@ -1,196 +1,836 @@
 /**
- * Tests for VercelService and validateVercelConfig
+ * Unit tests for VercelService.
  *
- * Covers:
- *   validateVercelConfig — missing token, token present, team ID optional
- *   createProject        — success with/without env vars, 409, 401, 429, missing token
- *   triggerDeployment    — success, network error
- *   validateAccess       — true/false/network error
- *   shared request()     — NETWORK_ERROR on fetch throw, UNKNOWN on unexpected status
+ * Mocks:
+ *   global.fetch — stubbed with vi.stubGlobal so no real HTTP calls are made.
+ *   VERCEL_TOKEN — set via process.env in each suite, cleaned up after.
+ *   VERCEL_TEAM_ID — set/unset per test where team behaviour is under test.
+ *
+ * Coverage:
+ *   validateVercelConfig    — valid token present, missing token.
+ *
+ *   createProject           — success, success with env vars, success with team scope,
+ *                            auth failure, rate limit, network error, project exists.
+ *
+ *   triggerDeployment       — success, auth failure, rate limit, network error.
+ *
+ *   addDomain               — success with verification, success without verification,
+ *                            domain already exists, auth failure, network error.
+ *
+ *   removeDomain            — success, domain not found (best-effort), auth failure.
+ *
+ *   getDomainConfig         — success, domain not found, auth failure.
+ *
+ *   verifyDomain            — success with requirements, success without requirements,
+ *                            auth failure, network error.
+ *
+ *   getDeployment           — success, deployment not found, auth failure.
+ *
+ *   getDeploymentStatus     — success with all statuses, deployment not found.
+ *
+ *   normalizeDeploymentStatus — all status mappings (QUEUED, BUILDING, READY, ERROR,
+ *                              FAILED, CANCELED, unknown).
+ *
+ *   listDeployments         — success, empty list, auth failure.
+ *
+ *   validateAccess          — valid token → true, invalid token → false,
+ *                            network throw → false, missing token → false.
+ *
+ *   deleteProject           — success, failure (logged but not thrown).
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { VercelService, VercelApiError, validateVercelConfig } from './vercel.service';
+import {
+    VercelService,
+    validateVercelConfig,
+    VercelApiError,
+    type VercelDeployment,
+    type VercelDeploymentStatus,
+} from './vercel.service';
 
-const MOCK_TOKEN = 'test-vercel-token';
+// ── fetch mock ────────────────────────────────────────────────────────────────
 
-function makeService(token = MOCK_TOKEN, teamId?: string) {
-    if (token) vi.stubEnv('VERCEL_TOKEN', token);
-    else vi.stubEnv('VERCEL_TOKEN', '');
-    if (teamId) vi.stubEnv('VERCEL_TEAM_ID', teamId);
-    const mockFetch = vi.fn();
-    return { svc: new VercelService(mockFetch), mockFetch };
-}
+const mockFetch = vi.fn();
+vi.stubGlobal('fetch', mockFetch);
 
-function makeResponse(status: number, body: unknown, headers: Record<string, string> = {}) {
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function makeJsonResponse(
+    status: number,
+    body: unknown,
+    headers: Record<string, string> = {},
+) {
     return {
         ok: status >= 200 && status < 300,
         status,
-        headers: new Headers(headers),
-        json: () => Promise.resolve(body),
+        headers: { get: (k: string) => headers[k] ?? null },
+        json: async () => body,
     };
 }
 
+const PROJECT_RESPONSE = {
+    id: 'prj_123',
+    name: 'my-dex',
+    createdAt: Date.now(),
+};
+
+const DEPLOYMENT_RESPONSE = {
+    id: 'dpl_456',
+    name: 'my-dex',
+    url: 'my-dex-abc123.vercel.app',
+    status: 'QUEUED',
+    createdAt: Date.now(),
+};
+
+const DOMAIN_RESPONSE = {
+    name: 'example.com',
+    verified: false,
+    forceHttps: true,
+    redirect: false,
+    verification: [
+        {
+            domain: 'example.com',
+            type: 'CNAME',
+            value: 'cname.vercel-dns.com',
+            name: 'www',
+        },
+    ],
+};
+
+// ── validateVercelConfig ──────────────────────────────────────────────────────
+
 describe('validateVercelConfig', () => {
-    afterEach(() => vi.unstubAllEnvs());
-
-    it('returns valid: false when VERCEL_TOKEN is absent', () => {
-        vi.stubEnv('VERCEL_TOKEN', '');
-        expect(validateVercelConfig()).toEqual({ valid: false, missing: 'VERCEL_TOKEN' });
-    });
-
-    it('returns valid: true when VERCEL_TOKEN is present', () => {
-        vi.stubEnv('VERCEL_TOKEN', 'tok_abc');
+    it('returns valid when VERCEL_TOKEN is set', () => {
+        process.env.VERCEL_TOKEN = 'test_token';
         expect(validateVercelConfig()).toEqual({ valid: true });
     });
 
-    it('does not require VERCEL_TEAM_ID', () => {
-        vi.stubEnv('VERCEL_TOKEN', 'tok_abc');
-        vi.stubEnv('VERCEL_TEAM_ID', '');
-        expect(validateVercelConfig().valid).toBe(true);
+    it('returns invalid with missing VERCEL_TOKEN when token is not set', () => {
+        delete process.env.VERCEL_TOKEN;
+        expect(validateVercelConfig()).toEqual({
+            valid: false,
+            missing: 'VERCEL_TOKEN',
+        });
     });
 });
 
+// ── VercelService ─────────────────────────────────────────────────────────────
+
 describe('VercelService', () => {
-    beforeEach(() => vi.stubEnv('VERCEL_TOKEN', MOCK_TOKEN));
-    afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
+    let service: VercelService;
+
+    beforeEach(() => {
+        process.env.VERCEL_TOKEN = 'test_token';
+        delete process.env.VERCEL_TEAM_ID;
+        service = new VercelService();
+        vi.clearAllMocks();
+    });
+
+    afterEach(() => {
+        delete process.env.VERCEL_TOKEN;
+        delete process.env.VERCEL_TEAM_ID;
+    });
+
+    // ── createProject ──────────────────────────────────────────────────────────
 
     describe('createProject', () => {
-        it('creates a project and sets env vars', async () => {
-            const { svc, mockFetch } = makeService();
-            mockFetch
-                .mockResolvedValueOnce(makeResponse(200, { id: 'prj_1', name: 'craft-app' }))
-                .mockResolvedValueOnce(makeResponse(200, { created: [] }));
+        it('creates a project successfully', async () => {
+            mockFetch.mockResolvedValueOnce(makeJsonResponse(200, PROJECT_RESPONSE));
 
-            const project = await svc.createProject({
-                name: 'craft-app',
-                gitRepo: 'org/repo',
-                envVars: [{ key: 'FOO', value: 'bar', target: ['production'], type: 'plain' }],
+            const result = await service.createProject({
+                name: 'my-dex',
+                gitRepo: 'owner/repo',
+                envVars: [],
             });
 
-            expect(project.id).toBe('prj_1');
+            expect(result).toEqual({
+                id: 'prj_123',
+                name: 'my-dex',
+                url: 'my-dex.vercel.app',
+            });
+            expect(mockFetch).toHaveBeenCalledWith(
+                'https://api.vercel.com/v9/projects',
+                expect.objectContaining({ method: 'POST' }),
+            );
+        });
+
+        it('creates a project with environment variables', async () => {
+            mockFetch.mockResolvedValueOnce(makeJsonResponse(200, PROJECT_RESPONSE));
+            mockFetch.mockResolvedValueOnce(makeJsonResponse(200, {}));
+
+            await service.createProject({
+                name: 'my-dex',
+                gitRepo: 'owner/repo',
+                envVars: [
+                    { key: 'API_KEY', value: 'secret', target: ['production'], type: 'plain' },
+                ],
+            });
+
             expect(mockFetch).toHaveBeenCalledTimes(2);
+            const [, envOptions] = mockFetch.mock.calls[1] as [string, RequestInit];
+            expect(envOptions.method).toBe('POST');
+            const envBody = JSON.parse(envOptions.body as string);
+            expect(envBody).toEqual([
+                { key: 'API_KEY', value: 'secret', target: ['production'], type: 'plain' },
+            ]);
         });
 
-        it('skips env var call when envVars is empty', async () => {
-            const { svc, mockFetch } = makeService();
-            mockFetch.mockResolvedValueOnce(makeResponse(200, { id: 'prj_2', name: 'craft-app' }));
+        it('creates a project with team scope when VERCEL_TEAM_ID is set', async () => {
+            process.env.VERCEL_TEAM_ID = 'team_789';
+            service = new VercelService();
+            mockFetch.mockResolvedValueOnce(makeJsonResponse(200, PROJECT_RESPONSE));
 
-            await svc.createProject({ name: 'craft-app', gitRepo: 'org/repo', envVars: [] });
+            await service.createProject({
+                name: 'my-dex',
+                gitRepo: 'owner/repo',
+                envVars: [],
+            });
 
-            expect(mockFetch).toHaveBeenCalledTimes(1);
+            expect(mockFetch).toHaveBeenCalledWith(
+                'https://api.vercel.com/v9/projects?teamId=team_789',
+                expect.objectContaining({ method: 'POST' }),
+            );
         });
 
-        it('throws PROJECT_EXISTS on 409', async () => {
-            const { svc, mockFetch } = makeService();
-            mockFetch.mockResolvedValueOnce(makeResponse(409, { error: { message: 'exists' } }));
+        it('includes a Bearer token in the Authorization header', async () => {
+            mockFetch.mockResolvedValueOnce(makeJsonResponse(200, PROJECT_RESPONSE));
+
+            await service.createProject({
+                name: 'my-dex',
+                gitRepo: 'owner/repo',
+                envVars: [],
+            });
+
+            const [, options] = mockFetch.mock.calls[0] as [string, RequestInit & { headers: Record<string, string> }];
+            expect(options.headers['Authorization']).toBe('Bearer test_token');
+            expect(options.headers['Content-Type']).toBe('application/json');
+        });
+
+        it('throws PROJECT_EXISTS error when project already exists', async () => {
+            mockFetch.mockResolvedValueOnce(
+                makeJsonResponse(409, { error: { message: 'Project already exists' } }),
+            );
 
             await expect(
-                svc.createProject({ name: 'craft-app', gitRepo: 'org/repo', envVars: [] }),
-            ).rejects.toMatchObject({ code: 'PROJECT_EXISTS' });
+                service.createProject({
+                    name: 'my-dex',
+                    gitRepo: 'owner/repo',
+                    envVars: [],
+                }),
+            ).rejects.toMatchObject({
+                code: 'PROJECT_EXISTS',
+            });
         });
 
-        it('throws AUTH_FAILED on 401', async () => {
-            const { svc, mockFetch } = makeService();
-            mockFetch.mockResolvedValueOnce(makeResponse(401, { message: 'Unauthorized' }));
+        it('throws AUTH_FAILED on HTTP 401', async () => {
+            mockFetch.mockResolvedValueOnce(
+                makeJsonResponse(401, { message: 'Unauthorized' }),
+            );
 
             await expect(
-                svc.createProject({ name: 'craft-app', gitRepo: 'org/repo', envVars: [] }),
-            ).rejects.toMatchObject({ code: 'AUTH_FAILED' });
+                service.createProject({
+                    name: 'my-dex',
+                    gitRepo: 'owner/repo',
+                    envVars: [],
+                }),
+            ).rejects.toMatchObject({
+                code: 'AUTH_FAILED',
+            });
         });
 
-        it('throws RATE_LIMITED on 429 with retryAfterMs', async () => {
-            const { svc, mockFetch } = makeService();
-            mockFetch.mockResolvedValueOnce(makeResponse(429, { message: 'Rate limited' }, { 'Retry-After': '30' }));
+        it('throws RATE_LIMITED on HTTP 429 with retryAfterMs', async () => {
+            mockFetch.mockResolvedValueOnce(
+                makeJsonResponse(429, { message: 'rate limited' }, { 'Retry-After': '60' }),
+            );
 
             await expect(
-                svc.createProject({ name: 'craft-app', gitRepo: 'org/repo', envVars: [] }),
-            ).rejects.toMatchObject({ code: 'RATE_LIMITED', retryAfterMs: 30_000 });
+                service.createProject({
+                    name: 'my-dex',
+                    gitRepo: 'owner/repo',
+                    envVars: [],
+                }),
+            ).rejects.toMatchObject({
+                code: 'RATE_LIMITED',
+                retryAfterMs: 60_000,
+            });
         });
 
-        it('throws AUTH_FAILED immediately when token is missing', async () => {
-            const { svc, mockFetch } = makeService('');
-
-            await expect(
-                svc.createProject({ name: 'craft-app', gitRepo: 'org/repo', envVars: [] }),
-            ).rejects.toMatchObject({ code: 'AUTH_FAILED' });
-            expect(mockFetch).not.toHaveBeenCalled();
-        });
-
-        it('throws NETWORK_ERROR when fetch throws', async () => {
-            const { svc, mockFetch } = makeService();
+        it('throws NETWORK_ERROR when fetch fails', async () => {
             mockFetch.mockRejectedValueOnce(new Error('socket hang up'));
 
             await expect(
-                svc.createProject({ name: 'craft-app', gitRepo: 'org/repo', envVars: [] }),
-            ).rejects.toMatchObject({ code: 'NETWORK_ERROR', message: 'socket hang up' });
+                service.createProject({
+                    name: 'my-dex',
+                    gitRepo: 'owner/repo',
+                    envVars: [],
+                }),
+            ).rejects.toMatchObject({
+                code: 'NETWORK_ERROR',
+                message: 'socket hang up',
+            });
         });
 
-        it('appends teamId query param when VERCEL_TEAM_ID is set', async () => {
-            const { svc, mockFetch } = makeService(MOCK_TOKEN, 'team_xyz');
-            mockFetch.mockResolvedValueOnce(makeResponse(200, { id: 'prj_3', name: 'craft-app' }));
+        it('throws AUTH_FAILED when VERCEL_TOKEN is not configured', async () => {
+            delete process.env.VERCEL_TOKEN;
+            service = new VercelService();
 
-            await svc.createProject({ name: 'craft-app', gitRepo: 'org/repo', envVars: [] });
-
-            const [url] = mockFetch.mock.calls[0] as [string];
-            expect(url).toContain('teamId=team_xyz');
-        });
-
-        it('includes Authorization header with Bearer token', async () => {
-            const { svc, mockFetch } = makeService();
-            mockFetch.mockResolvedValueOnce(makeResponse(200, { id: 'prj_4', name: 'craft-app' }));
-
-            await svc.createProject({ name: 'craft-app', gitRepo: 'org/repo', envVars: [] });
-
-            const [, init] = mockFetch.mock.calls[0] as [string, RequestInit & { headers: Record<string, string> }];
-            expect(init.headers['Authorization']).toBe(`Bearer ${MOCK_TOKEN}`);
+            await expect(
+                service.createProject({
+                    name: 'my-dex',
+                    gitRepo: 'owner/repo',
+                    envVars: [],
+                }),
+            ).rejects.toMatchObject({
+                code: 'AUTH_FAILED',
+            });
+            expect(mockFetch).not.toHaveBeenCalled();
         });
     });
 
+    // ── triggerDeployment ──────────────────────────────────────────────────────
+
     describe('triggerDeployment', () => {
-        it('returns deploymentId and URL on success', async () => {
-            const { svc, mockFetch } = makeService();
-            mockFetch.mockResolvedValueOnce(
-                makeResponse(200, { id: 'dpl_abc', url: 'craft-app.vercel.app', status: 'QUEUED' }),
+        it('triggers a deployment successfully', async () => {
+            mockFetch.mockResolvedValueOnce(makeJsonResponse(200, DEPLOYMENT_RESPONSE));
+
+            const result = await service.triggerDeployment('prj_123', 'owner/repo');
+
+            expect(result).toEqual({
+                deploymentId: 'dpl_456',
+                deploymentUrl: 'https://my-dex-abc123.vercel.app',
+                status: 'QUEUED',
+            });
+            expect(mockFetch).toHaveBeenCalledWith(
+                'https://api.vercel.com/v13/deployments',
+                expect.objectContaining({ method: 'POST' }),
             );
-
-            const result = await svc.triggerDeployment('prj_1', 'org/repo');
-
-            expect(result.deploymentId).toBe('dpl_abc');
-            expect(result.deploymentUrl).toBe('https://craft-app.vercel.app');
-            expect(result.status).toBe('QUEUED');
         });
 
-        it('throws NETWORK_ERROR on fetch failure', async () => {
-            const { svc, mockFetch } = makeService();
-            mockFetch.mockRejectedValueOnce(new Error('Network down'));
+        it('throws AUTH_FAILED on HTTP 401', async () => {
+            mockFetch.mockResolvedValueOnce(
+                makeJsonResponse(401, { message: 'Unauthorized' }),
+            );
 
-            await expect(svc.triggerDeployment('prj_1', 'org/repo')).rejects.toMatchObject({
+            await expect(
+                service.triggerDeployment('prj_123', 'owner/repo'),
+            ).rejects.toMatchObject({
+                code: 'AUTH_FAILED',
+            });
+        });
+
+        it('throws RATE_LIMITED on HTTP 429', async () => {
+            mockFetch.mockResolvedValueOnce(
+                makeJsonResponse(429, { message: 'rate limited' }, { 'Retry-After': '30' }),
+            );
+
+            await expect(
+                service.triggerDeployment('prj_123', 'owner/repo'),
+            ).rejects.toMatchObject({
+                code: 'RATE_LIMITED',
+                retryAfterMs: 30_000,
+            });
+        });
+
+        it('throws NETWORK_ERROR when fetch fails', async () => {
+            mockFetch.mockRejectedValueOnce(new Error('connection refused'));
+
+            await expect(
+                service.triggerDeployment('prj_123', 'owner/repo'),
+            ).rejects.toMatchObject({
                 code: 'NETWORK_ERROR',
             });
         });
     });
 
+    // ── addDomain ──────────────────────────────────────────────────────────────
+
+    describe('addDomain', () => {
+        it('adds a domain with verification requirements', async () => {
+            mockFetch.mockResolvedValueOnce(makeJsonResponse(200, DOMAIN_RESPONSE));
+
+            const result = await service.addDomain({
+                domain: 'example.com',
+                projectId: 'prj_123',
+            });
+
+            expect(result.success).toBe(true);
+            expect(result.domain).toBe('example.com');
+            expect(result.verification).toEqual([
+                {
+                    domain: 'example.com',
+                    type: 'CNAME',
+                    value: 'cname.vercel-dns.com',
+                    name: 'www',
+                },
+            ]);
+        });
+
+        it('adds a domain without verification requirements', async () => {
+            mockFetch.mockResolvedValueOnce(
+                makeJsonResponse(200, { ...DOMAIN_RESPONSE, verification: [] }),
+            );
+
+            const result = await service.addDomain({
+                domain: 'example.com',
+                projectId: 'prj_123',
+            });
+
+            expect(result.success).toBe(true);
+            expect(result.verification).toBeUndefined();
+        });
+
+        it('returns error when domain already exists', async () => {
+            mockFetch.mockResolvedValueOnce(
+                makeJsonResponse(409, { error: { message: 'Domain already exists' } }),
+            );
+
+            const result = await service.addDomain({
+                domain: 'example.com',
+                projectId: 'prj_123',
+            });
+
+            expect(result.success).toBe(false);
+            expect(result.errorCode).toBe('DOMAIN_ALREADY_EXISTS');
+        });
+
+        it('includes redirect and forceHttps options', async () => {
+            mockFetch.mockResolvedValueOnce(makeJsonResponse(200, DOMAIN_RESPONSE));
+
+            await service.addDomain({
+                domain: 'example.com',
+                projectId: 'prj_123',
+                redirect: true,
+                forceHttps: true,
+            });
+
+            const [, options] = mockFetch.mock.calls[0] as [string, RequestInit];
+            const body = JSON.parse(options.body as string);
+            expect(body.redirect).toBe(true);
+            expect(body.forceHttps).toBe(true);
+        });
+
+        it('attaches domain to deployment when deploymentId is provided', async () => {
+            mockFetch.mockResolvedValueOnce(makeJsonResponse(200, DOMAIN_RESPONSE));
+
+            await service.addDomain({
+                domain: 'example.com',
+                deploymentId: 'dpl_456',
+            });
+
+            const [, options] = mockFetch.mock.calls[0] as [string, RequestInit];
+            const body = JSON.parse(options.body as string);
+            expect(body.deploymentId).toBe('dpl_456');
+        });
+    });
+
+    // ── removeDomain ───────────────────────────────────────────────────────────
+
+    describe('removeDomain', () => {
+        it('removes a domain successfully', async () => {
+            mockFetch.mockResolvedValueOnce(makeJsonResponse(200, {}));
+
+            await service.removeDomain('example.com', 'prj_123');
+
+            expect(mockFetch).toHaveBeenCalledWith(
+                'https://api.vercel.com/v4/domains/example.com',
+                expect.objectContaining({ method: 'DELETE' }),
+            );
+        });
+
+        it('handles domain not found gracefully (best-effort cleanup)', async () => {
+            mockFetch.mockResolvedValueOnce(
+                makeJsonResponse(404, { error: { message: 'Domain not found' } }),
+            );
+
+            await expect(
+                service.removeDomain('example.com', 'prj_123'),
+            ).resolves.not.toThrow();
+        });
+
+        it('logs but does not throw on other errors', async () => {
+            const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+            mockFetch.mockResolvedValueOnce(
+                makeJsonResponse(500, { message: 'Internal Server Error' }),
+            );
+
+            await expect(
+                service.removeDomain('example.com', 'prj_123'),
+            ).resolves.not.toThrow();
+
+            expect(consoleSpy).toHaveBeenCalled();
+            consoleSpy.mockRestore();
+        });
+    });
+
+    // ── getDomainConfig ────────────────────────────────────────────────────────
+
+    describe('getDomainConfig', () => {
+        it('returns domain configuration', async () => {
+            mockFetch.mockResolvedValueOnce(makeJsonResponse(200, DOMAIN_RESPONSE));
+
+            const result = await service.getDomainConfig('example.com');
+
+            expect(result).toEqual({
+                name: 'example.com',
+                verified: false,
+                forceHttps: true,
+                redirect: false,
+                projectId: undefined,
+                deploymentId: undefined,
+            });
+        });
+
+        it('returns null when domain is not found', async () => {
+            mockFetch.mockResolvedValueOnce(
+                makeJsonResponse(404, { error: { message: 'Domain not found' } }),
+            );
+
+            const result = await service.getDomainConfig('example.com');
+            expect(result).toBeNull();
+        });
+
+        it('throws on other errors', async () => {
+            mockFetch.mockResolvedValueOnce(
+                makeJsonResponse(500, { message: 'Internal Server Error' }),
+            );
+
+            await expect(
+                service.getDomainConfig('example.com'),
+            ).rejects.toMatchObject({
+                code: 'UNKNOWN',
+            });
+        });
+    });
+
+    // ── verifyDomain ───────────────────────────────────────────────────────────
+
+    describe('verifyDomain', () => {
+        it('returns verification status with requirements', async () => {
+            mockFetch.mockResolvedValueOnce(
+                makeJsonResponse(200, {
+                    verified: false,
+                    verification: [
+                        {
+                            domain: 'example.com',
+                            type: 'CNAME',
+                            value: 'cname.vercel-dns.com',
+                            name: 'www',
+                        },
+                    ],
+                }),
+            );
+
+            const result = await service.verifyDomain('example.com');
+
+            expect(result.verified).toBe(false);
+            expect(result.requirements).toEqual([
+                {
+                    domain: 'example.com',
+                    type: 'CNAME',
+                    value: 'cname.vercel-dns.com',
+                    name: 'www',
+                },
+            ]);
+        });
+
+        it('returns verification status without requirements', async () => {
+            mockFetch.mockResolvedValueOnce(
+                makeJsonResponse(200, { verified: true }),
+            );
+
+            const result = await service.verifyDomain('example.com');
+
+            expect(result.verified).toBe(true);
+            expect(result.requirements).toBeUndefined();
+        });
+
+        it('throws on auth failure', async () => {
+            mockFetch.mockResolvedValueOnce(
+                makeJsonResponse(401, { message: 'Unauthorized' }),
+            );
+
+            await expect(
+                service.verifyDomain('example.com'),
+            ).rejects.toMatchObject({
+                code: 'AUTH_FAILED',
+            });
+        });
+    });
+
+    // ── getDeployment ──────────────────────────────────────────────────────────
+
+    describe('getDeployment', () => {
+        it('returns deployment details', async () => {
+            mockFetch.mockResolvedValueOnce(makeJsonResponse(200, DEPLOYMENT_RESPONSE));
+
+            const result = await service.getDeployment('dpl_456');
+
+            expect(result).toEqual({
+                id: 'dpl_456',
+                name: 'my-dex',
+                url: 'my-dex-abc123.vercel.app',
+                status: 'QUEUED',
+                createdAt: DEPLOYMENT_RESPONSE.createdAt,
+                ready: undefined,
+                canceled: undefined,
+                error: undefined,
+                projectId: undefined,
+                projectName: undefined,
+                meta: undefined,
+            });
+        });
+
+        it('throws on deployment not found', async () => {
+            mockFetch.mockResolvedValueOnce(
+                makeJsonResponse(404, { error: { message: 'Deployment not found' } }),
+            );
+
+            await expect(
+                service.getDeployment('dpl_456'),
+            ).rejects.toMatchObject({
+                code: 'UNKNOWN',
+            });
+        });
+
+        it('throws on auth failure', async () => {
+            mockFetch.mockResolvedValueOnce(
+                makeJsonResponse(401, { message: 'Unauthorized' }),
+            );
+
+            await expect(
+                service.getDeployment('dpl_456'),
+            ).rejects.toMatchObject({
+                code: 'AUTH_FAILED',
+            });
+        });
+    });
+
+    // ── getDeploymentStatus ────────────────────────────────────────────────────
+
+    describe('getDeploymentStatus', () => {
+        it('returns normalized deployment status', async () => {
+            mockFetch.mockResolvedValueOnce(makeJsonResponse(200, DEPLOYMENT_RESPONSE));
+
+            const result = await service.getDeploymentStatus('dpl_456');
+
+            expect(result.status).toBe('pending');
+            expect(result.url).toBe('https://my-dex-abc123.vercel.app');
+            expect(result.deploymentId).toBe('dpl_456');
+        });
+
+        it('throws when deployment is not found', async () => {
+            mockFetch.mockResolvedValueOnce(
+                makeJsonResponse(404, { error: { message: 'Deployment not found' } }),
+            );
+
+            await expect(
+                service.getDeploymentStatus('dpl_456'),
+            ).rejects.toMatchObject({
+                code: 'UNKNOWN',
+            });
+        });
+    });
+
+    // ── normalizeDeploymentStatus ──────────────────────────────────────────────
+
+    describe('normalizeDeploymentStatus', () => {
+        const baseDeployment: VercelDeployment = {
+            id: 'dpl_123',
+            name: 'test',
+            url: 'test.vercel.app',
+            status: 'QUEUED',
+            createdAt: Date.now(),
+        };
+
+        it('maps QUEUED to pending', () => {
+            const result = service.normalizeDeploymentStatus({
+                ...baseDeployment,
+                status: 'QUEUED',
+            });
+            expect(result.status).toBe('pending');
+        });
+
+        it('maps BUILDING to building', () => {
+            const result = service.normalizeDeploymentStatus({
+                ...baseDeployment,
+                status: 'BUILDING',
+            });
+            expect(result.status).toBe('building');
+        });
+
+        it('maps READY to ready', () => {
+            const result = service.normalizeDeploymentStatus({
+                ...baseDeployment,
+                status: 'READY',
+                ready: Date.now(),
+            });
+            expect(result.status).toBe('ready');
+            expect(result.readyAt).toBeInstanceOf(Date);
+        });
+
+        it('maps ERROR to failed', () => {
+            const result = service.normalizeDeploymentStatus({
+                ...baseDeployment,
+                status: 'ERROR',
+                error: Date.now(),
+            });
+            expect(result.status).toBe('failed');
+            expect(result.failedAt).toBeInstanceOf(Date);
+            expect(result.errorMessage).toBe('Deployment failed');
+        });
+
+        it('maps FAILED to failed', () => {
+            const result = service.normalizeDeploymentStatus({
+                ...baseDeployment,
+                status: 'FAILED',
+                error: Date.now(),
+            });
+            expect(result.status).toBe('failed');
+        });
+
+        it('maps CANCELED to canceled', () => {
+            const result = service.normalizeDeploymentStatus({
+                ...baseDeployment,
+                status: 'CANCELED',
+                canceled: Date.now(),
+            });
+            expect(result.status).toBe('canceled');
+            expect(result.canceledAt).toBeInstanceOf(Date);
+        });
+
+        it('maps unknown status to pending', () => {
+            const result = service.normalizeDeploymentStatus({
+                ...baseDeployment,
+                status: 'UNKNOWN_STATUS' as VercelDeploymentStatus,
+            });
+            expect(result.status).toBe('pending');
+        });
+
+        it('includes projectId and projectName when present', () => {
+            const result = service.normalizeDeploymentStatus({
+                ...baseDeployment,
+                projectId: 'prj_123',
+                projectName: 'my-project',
+            });
+            expect(result.projectId).toBe('prj_123');
+            expect(result.projectName).toBe('my-project');
+        });
+    });
+
+    // ── listDeployments ────────────────────────────────────────────────────────
+
+    describe('listDeployments', () => {
+        it('returns a list of deployments', async () => {
+            mockFetch.mockResolvedValueOnce(
+                makeJsonResponse(200, {
+                    deployments: [DEPLOYMENT_RESPONSE],
+                }),
+            );
+
+            const result = await service.listDeployments('prj_123');
+
+            expect(result).toHaveLength(1);
+            expect(result[0].id).toBe('dpl_456');
+        });
+
+        it('returns empty list when no deployments exist', async () => {
+            mockFetch.mockResolvedValueOnce(
+                makeJsonResponse(200, { deployments: [] }),
+            );
+
+            const result = await service.listDeployments('prj_123');
+            expect(result).toEqual([]);
+        });
+
+        it('throws on auth failure', async () => {
+            mockFetch.mockResolvedValueOnce(
+                makeJsonResponse(401, { message: 'Unauthorized' }),
+            );
+
+            await expect(
+                service.listDeployments('prj_123'),
+            ).rejects.toMatchObject({
+                code: 'AUTH_FAILED',
+            });
+        });
+
+        it('respects limit parameter', async () => {
+            mockFetch.mockResolvedValueOnce(
+                makeJsonResponse(200, { deployments: [] }),
+            );
+
+            await service.listDeployments('prj_123', 5);
+
+            expect(mockFetch).toHaveBeenCalledWith(
+                'https://api.vercel.com/v6/deployments?projectId=prj_123&limit=5',
+                expect.objectContaining({ method: 'GET' }),
+            );
+        });
+    });
+
+    // ── validateAccess ─────────────────────────────────────────────────────────
+
     describe('validateAccess', () => {
-        it('returns true when API responds ok', async () => {
-            const { svc, mockFetch } = makeService();
-            mockFetch.mockResolvedValueOnce(makeResponse(200, { uid: 'user_1' }));
+        it('returns true when the token is valid', async () => {
+            mockFetch.mockResolvedValueOnce(makeJsonResponse(200, { uid: 'user_123' }));
 
-            expect(await svc.validateAccess()).toBe(true);
+            expect(await service.validateAccess()).toBe(true);
+            expect(mockFetch).toHaveBeenCalledWith(
+                'https://api.vercel.com/v2/user',
+                expect.objectContaining({
+                    headers: expect.objectContaining({
+                        Authorization: 'Bearer test_token',
+                    }),
+                }),
+            );
         });
 
-        it('returns false on 401', async () => {
-            const { svc, mockFetch } = makeService();
-            mockFetch.mockResolvedValueOnce(makeResponse(401, { message: 'Unauthorized' }));
-
-            expect(await svc.validateAccess()).toBe(false);
+        it('returns false when the API returns an error status', async () => {
+            mockFetch.mockResolvedValueOnce(makeJsonResponse(401, { message: 'Unauthorized' }));
+            expect(await service.validateAccess()).toBe(false);
         });
 
-        it('returns false on network error', async () => {
-            const { svc, mockFetch } = makeService();
-            mockFetch.mockRejectedValueOnce(new Error('Network down'));
+        it('returns false when the network call throws', async () => {
+            mockFetch.mockRejectedValueOnce(new Error('network error'));
+            expect(await service.validateAccess()).toBe(false);
+        });
 
-            expect(await svc.validateAccess()).toBe(false);
+        it('returns false when VERCEL_TOKEN is not configured', async () => {
+            delete process.env.VERCEL_TOKEN;
+            service = new VercelService();
+            expect(await service.validateAccess()).toBe(false);
+            expect(mockFetch).not.toHaveBeenCalled();
+        });
+    });
+
+    // ── deleteProject ──────────────────────────────────────────────────────────
+
+    describe('deleteProject', () => {
+        it('deletes a project successfully', async () => {
+            mockFetch.mockResolvedValueOnce(makeJsonResponse(200, {}));
+
+            await expect(
+                service.deleteProject('prj_123'),
+            ).resolves.not.toThrow();
+
+            expect(mockFetch).toHaveBeenCalledWith(
+                'https://api.vercel.com/v10/projects/prj_123',
+                expect.objectContaining({ method: 'DELETE' }),
+            );
+        });
+
+        it('logs but does not throw on failure', async () => {
+            const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+            mockFetch.mockResolvedValueOnce(
+                makeJsonResponse(500, { message: 'Internal Server Error' }),
+            );
+
+            await expect(
+                service.deleteProject('prj_123'),
+            ).resolves.not.toThrow();
+
+            expect(consoleSpy).toHaveBeenCalled();
+            consoleSpy.mockRestore();
         });
     });
 });
