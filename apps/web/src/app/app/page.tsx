@@ -1,6 +1,7 @@
 'use client';
 
 import { AppShell } from '@/components/app';
+import { TierUsageIndicators } from '@/components/app/TierUsageIndicators';
 import { User, NavItem } from '@/types/navigation';
 
 // Mock data for demonstration
@@ -64,6 +65,12 @@ const navItems: NavItem[] = [
     path: '/app/billing',
   },
 ];
+
+const mockTierUsage = {
+  tier: 'pro' as const,
+  activeDeployments: 8,
+  activeCustomDomains: 1,
+};
 
 export default function AppDashboard() {
   return (
@@ -140,6 +147,14 @@ export default function AppDashboard() {
                 </div>
               ))}
             </div>
+          </div>
+
+          <div className="mt-8">
+            <TierUsageIndicators
+              tier={mockTierUsage.tier}
+              activeDeployments={mockTierUsage.activeDeployments}
+              activeCustomDomains={mockTierUsage.activeCustomDomains}
+            />
           </div>
         </div>
       </div>

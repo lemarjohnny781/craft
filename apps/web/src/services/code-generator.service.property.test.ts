@@ -737,3 +737,90 @@ describe('Property 46 – Stellar SDK Inclusion', () => {
         }
     );
 });
+
+// ── Property 47 – Soroban Configuration Inclusion ───────────────────────────
+
+/**
+ * Property 47 – Soroban Configuration Inclusion
+ *
+ * For any generated Soroban template, the output must include
+ * RPC client configuration that is wired to runtime config/env values.
+ */
+describe('Property 47 – Soroban Configuration Inclusion', () => {
+    const svc = new CodeGeneratorService();
+
+    it(
+        '47-A: soroban-defi generation always includes Soroban RPC configuration with runtime config wiring',
+        () => {
+            /**
+             * Feature: code-generation, Property 47: Soroban Configuration Inclusion
+             * Validates: Requirements 7.4, 17.3
+             */
+            fc.assert(
+                fc.property(arbCustomizationConfig, (cfg) => {
+                    const result = svc.generate({
+                        templateId: 'soroban-defi',
+                        templateFamily: 'soroban-defi',
+                        customization: cfg,
+                        outputPath: '/tmp/out',
+                    });
+
+                    expect(result.success).toBe(true);
+
+                    const sorobanContent = getFile(result.generatedFiles, 'src/lib/soroban.ts')!;
+                    expect(sorobanContent).toBeDefined();
+                    expect(sorobanContent).toContain('new SorobanRpc.Server');
+                    expect(sorobanContent).toContain('config.stellar.sorobanRpcUrl');
+
+                    const configContent = getFile(result.generatedFiles, 'src/lib/config.ts')!;
+                    expect(configContent).toContain('NEXT_PUBLIC_SOROBAN_RPC_URL');
+                }),
+                { numRuns: 100 }
+            );
+        }
+    );
+});
+
+// ── Property 48 – Stellar Error Handling Inclusion ──────────────────────────
+
+/**
+ * Property 48 – Stellar Error Handling Inclusion
+ *
+ * For any generated template, Stellar operations in src/lib/stellar.ts must
+ * include explicit try/catch error handling and descriptive failure messages.
+ */
+describe('Property 48 – Stellar Error Handling Inclusion', () => {
+    const svc = new CodeGeneratorService();
+
+    it(
+        '48-A: generated stellar client always includes explicit error handling for account and transaction operations',
+        () => {
+            /**
+             * Feature: code-generation, Property 48: Stellar Error Handling Inclusion
+             * Validates: Requirements 7.4, 17.1, 17.4
+             */
+            fc.assert(
+                fc.property(arbTemplateFamily, arbCustomizationConfig, (family, cfg) => {
+                    const result = svc.generate({
+                        templateId: family,
+                        templateFamily: family,
+                        customization: cfg,
+                        outputPath: '/tmp/out',
+                    });
+
+                    expect(result.success).toBe(true);
+
+                    const stellarContent = getFile(result.generatedFiles, 'src/lib/stellar.ts')!;
+                    expect(stellarContent).toBeDefined();
+
+                    expect(stellarContent).toContain('try {');
+                    expect(stellarContent).toContain('catch (error)');
+                    expect(stellarContent).toContain('Failed to load account');
+                    expect(stellarContent).toContain('Failed to submit transaction');
+                    expect(stellarContent).toContain('throw new Error');
+                }),
+                { numRuns: 100 }
+            );
+        }
+    );
+});
