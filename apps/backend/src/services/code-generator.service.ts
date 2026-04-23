@@ -25,6 +25,8 @@ import type {
 import type { GeneratedFile, GenerationResult, GenerationRequest } from '@craft/types';
 import { renderEnvLocal, renderEnvExample, buildVercelEnvVars } from '@/lib/env/env-template-generator';
 export { renderEnvLocal, renderEnvExample, buildVercelEnvVars };
+import { generateFeatureFlagsFile } from '@/lib/features/feature-flag-generator';
+import { generateBrandingCss } from '@/lib/branding/branding-replacer';
 
 // ── Network constants ─────────────────────────────────────────────────────────
 
